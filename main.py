@@ -151,7 +151,6 @@ def build_aiohttp_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/slack/events", slack_events)
     app.router.add_post("/webhook/github", github_webhook)
-    app.router.add_get("/healthz", lambda _: web.json_response({"ok": True}))
     return app
 
 
