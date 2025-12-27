@@ -1,4 +1,9 @@
-# pyproject.toml (append)
+[project]
+name = "pr-slackbot"
+version = "0.1.0"
+description = "Slack bot for PR approvals"
+requires-python = ">=3.10"
+
 dependencies = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
@@ -8,4 +13,5 @@ dependencies = [
   "python-dotenv>=1.0",
   "pyjwt>=2.8",
   "cryptography>=42.0",
+  "aiohttp>=3.13.2",
 ]
