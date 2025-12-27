@@ -147,13 +147,38 @@ async def github_webhook(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def create_pr(
+    repo_full: str = "freshcabbage123/pr-sbot",
+    base: str = "main",
+    head: str = "feat123",
+    title: str = "chore: test PR (created by GitHub App)",
+    body: str = "Auto-created PR for Slack approval testing.",
+) -> dict:
+    owner, repo = repo_full.split("/", 1)
+    inst = await github_installation_token()
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+    headers = {
+        "Authorization": f"Bearer {inst}",
+        "Accept": "application/vnd.github+json",
+        # "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {"title": title, "head": head, "base": base, "body": body}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
 def build_aiohttp_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/slack/events", slack_events)
     app.router.add_post("/webhook/github", github_webhook)
     return app
 
-
 if __name__ == "__main__":
+    import asyncio
+    pr = asyncio.run(create_pr())
+    print("Created PR:", pr["html_url"], "number:", pr["number"])
     port = int(os.environ.get("PORT", "3000"))
     web.run_app(build_aiohttp_app(), port=port)
