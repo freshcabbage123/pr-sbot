@@ -179,23 +179,6 @@ async def github_webhook(request: web.Request) -> web.Response:
             author = pr["user"]["login"]
 
             channel_id = os.environ["SLACK_PR_CHANNEL_ID"]
-            # await bolt_app.client.chat_postMessage(
-            #     channel=channel_id,
-            #     text=f"PR #{number}: {title}",
-            #     blocks=[
-            #         {"type": "header", "text": {"type": "plain_text",
-            #                                     "text": f"PR #{number}: {title}"}},
-            #         {"type": "section",
-            #          "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
-            #         {"type": "actions", "elements": [
-            #             {"type": "button",
-            #              "text": {"type": "plain_text", "text": "Approve ✅"},
-            #              "style": "primary",
-            #              "action_id": "pr_approve",
-            #              "value": encode_ref(repo_full, number)},
-            #         ]},
-            #     ],
-            # )
             files = await github_pr_files(repo_full, number)
             diff_blocks = build_diff_blocks(files, max_files=6)
             await bolt_app.client.chat_postMessage(
@@ -229,29 +212,3 @@ def build_aiohttp_app() -> web.Application:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
     web.run_app(build_aiohttp_app(), port=port)
-
-
-# async def create_pr(
-#     repo_full: str = "freshcabbage123/pr-sbot",
-#     base: str = "main",
-#     head: str = "feat123",
-#     title: str = "chore: test PR (created by GitHub App)",
-#     body: str = "Auto-created PR for Slack approval testing.",
-# ) -> dict:
-#     owner, repo = repo_full.split("/", 1)
-#     inst = await github_installation_token()
-
-#     url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-#     headers = {
-#         "Authorization": f"Bearer {inst}",
-#         "Accept": "application/vnd.github+json",
-#         # "X-GitHub-Api-Version": "2022-11-28",
-#     }
-#     payload = {"title": title, "head": head, "base": base, "body": body}
-
-#     async with httpx.AsyncClient(timeout=15) as client:
-#         r = await client.post(url, headers=headers, json=payload)
-#         if r.status_code == 422:
-#             print("422 body:", r.text)
-#         r.raise_for_status()
-#         return r.json()
