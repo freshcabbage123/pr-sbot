@@ -47,7 +47,7 @@ async def github_installation_token() -> str:
     headers = {"Authorization": f"Bearer {token}",
                "Accept": "application/vnd.github+json"}
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=14) as client:
         r = await client.post(url, headers=headers)
         r.raise_for_status()
         return r.json()["token"]
