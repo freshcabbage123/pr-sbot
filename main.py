@@ -185,6 +185,36 @@ def set_actions(blocks: list[dict[str, Any]], *, state: str, provider: str, payl
     return blocks
 
 
+def get_actor(body: Mapping[str, Any]) -> str:
+    return body.get("user", {}).get("name") or body.get("user", {}).get("id", "unknown")
+
+
+def require_provider(provider_key: str) -> Provider:
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        raise web.HTTPBadRequest(text="Unknown provider")
+    return provider
+
+
+async def ensure_authorized(provider: Provider, payload: str, actor: str, action: str, *, client, channel: str, user: str) -> bool:
+    """Authorize or emit an ephemeral denial; returns True if authorized."""
+    try:
+        await provider.authorize(payload, actor=actor, action=action)
+        return True
+    except web.HTTPForbidden:
+        verb = {
+            "approve": "approve",
+            "merge": "merge",
+            "request_changes": "request changes",
+        }.get(action, action)
+        await client.chat_postEphemeral(
+            channel=channel,
+            user=user,
+            text=f"You don't have permission to {verb} this change.",
+        )
+        return False
+
+
 def is_pr_message(msg: Mapping[str, Any], *, number: int, repo_full: str) -> bool:
     """Heuristic to identify a PR message we posted earlier."""
     text = msg.get("text", "")
@@ -423,20 +453,10 @@ PROVIDERS: dict[str, Provider] = {
 async def on_change_request_approve(ack, body, client):
     await ack()
     provider_key, payload = decode_ref(body["actions"][0]["value"])
-    actor = body["user"].get("name") or body["user"]["id"]
+    actor = get_actor(body)
+    provider = require_provider(provider_key)
 
-    provider = PROVIDERS.get(provider_key)
-    if not provider:
-        raise web.HTTPBadRequest(text="Unknown provider")
-
-    try:
-        await provider.authorize(payload, actor=actor, action="approve")
-    except web.HTTPForbidden:
-        await client.chat_postEphemeral(
-            channel=body["channel"]["id"],
-            user=body["user"]["id"],
-            text="You don't have permission to approve this change.",
-        )
+    if not await ensure_authorized(provider, payload, actor, "approve", client=client, channel=body["channel"]["id"], user=body["user"]["id"]):
         return
 
     await provider.approve(payload, actor=actor)
@@ -459,20 +479,10 @@ async def on_change_request_approve(ack, body, client):
 async def on_request_changes(ack, body, client):
     await ack()
     provider_key, payload = decode_ref(body["actions"][0]["value"])
-    actor = body["user"].get("name") or body["user"]["id"]
+    actor = get_actor(body)
+    provider = require_provider(provider_key)
 
-    provider = PROVIDERS.get(provider_key)
-    if not provider:
-        raise web.HTTPBadRequest(text="Unknown provider")
-
-    try:
-        await provider.authorize(payload, actor=actor, action="request_changes")
-    except web.HTTPForbidden:
-        await client.chat_postEphemeral(
-            channel=body["channel"]["id"],
-            user=body["user"]["id"],
-            text="You don't have permission to request changes on this.",
-        )
+    if not await ensure_authorized(provider, payload, actor, "request_changes", client=client, channel=body["channel"]["id"], user=body["user"]["id"]):
         return
 
     await client.views_open(
@@ -526,20 +536,13 @@ async def handle_request_changes_submit(ack, body, client, view):
     if not provider:
         return
 
-    actor = body["user"].get("name") or body["user"]["id"]
+    actor = get_actor(body)
     comment = view["state"]["values"]["comment"]["value"].get(
         "value", "").strip()
     if not comment:
         comment = "(no comment provided)"
 
-    try:
-        await provider.authorize(payload, actor=actor, action="request_changes")
-    except web.HTTPForbidden:
-        await client.chat_postEphemeral(
-            channel=channel,
-            user=body["user"]["id"],
-            text="You don't have permission to request changes on this.",
-        )
+    if not await ensure_authorized(provider, payload, actor, "request_changes", client=client, channel=channel, user=body["user"]["id"]):
         return
 
     await provider.request_changes(payload, actor=actor, comment=comment)
@@ -563,20 +566,10 @@ async def handle_request_changes_submit(ack, body, client, view):
 async def on_pr_merge(ack, body, client):
     await ack()
     provider_key, payload = decode_ref(body["actions"][0]["value"])
-    actor = body["user"].get("name") or body["user"]["id"]
+    actor = get_actor(body)
+    provider = require_provider(provider_key)
 
-    provider = PROVIDERS.get(provider_key)
-    if not provider:
-        raise web.HTTPBadRequest(text="Unknown provider")
-
-    try:
-        await provider.authorize(payload, actor=actor, action="merge")
-    except web.HTTPForbidden:
-        await client.chat_postEphemeral(
-            channel=body["channel"]["id"],
-            user=body["user"]["id"],
-            text="You don't have permission to merge this change.",
-        )
+    if not await ensure_authorized(provider, payload, actor, "merge", client=client, channel=body["channel"]["id"], user=body["user"]["id"]):
         return
 
     await provider.merge(payload, actor=actor)
