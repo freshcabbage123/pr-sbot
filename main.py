@@ -114,6 +114,9 @@ class Provider(Protocol):
     async def approve(self, payload: str, *, actor: str) -> None:
         """Approve a change given the encoded payload from Slack action."""
 
+    async def merge(self, payload: str, *, actor: str) -> None:
+        """Merge a change given the encoded payload from Slack action."""
+
 
 def encode_ref(provider: str, payload: str) -> str:
     return f"{provider}:{payload}"
@@ -122,6 +125,51 @@ def encode_ref(provider: str, payload: str) -> str:
 def decode_ref(value: str) -> tuple[str, str]:
     provider, payload = value.split(":", 1)
     return provider, payload
+
+
+def set_state(blocks: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    # Update or append a state context block for Slack message updates
+    for b in blocks:
+        if b.get("block_id") == "state" and b.get("type") == "context":
+            if b.get("elements"):
+                b["elements"][0]["text"] = text
+            return blocks
+
+    blocks.append({
+        "type": "context",
+        "block_id": "state",
+        "elements": [{"type": "mrkdwn", "text": text}],
+    })
+    return blocks
+
+
+def set_actions(blocks: list[dict[str, Any]], *, approved: bool, provider: str, payload: str) -> list[dict[str, Any]]:
+    """Toggle action buttons: show approve OR merge depending on state."""
+    new_elements: list[dict[str, Any]]
+    if approved:
+        new_elements = [{
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Merge 🚀"},
+            "style": "primary",
+            "action_id": "pr_merge",
+            "value": encode_ref(provider, payload),
+        }]
+    else:
+        new_elements = [{
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Approve ✅"},
+            "style": "primary",
+            "action_id": "pr_approve",
+            "value": encode_ref(provider, payload),
+        }]
+
+    for b in blocks:
+        if b.get("type") == "actions":
+            b["elements"] = new_elements
+            return blocks
+
+    blocks.append({"type": "actions", "elements": new_elements})
+    return blocks
 
 
 # -----------------------
@@ -165,6 +213,20 @@ class GithubProvider:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
 
+    async def _merge_pr(self, repo_full: str, number: int, *, actor: str, installation_id: str) -> None:
+        owner, name = repo_full.split("/", 1)
+        inst_token = await github_installation_token(installation_id)
+
+        url = f"https://api.github.com/repos/{owner}/{name}/pulls/{number}/merge"
+        headers = {"Authorization": f"Bearer {inst_token}",
+                   "Accept": "application/vnd.github+json"}
+        payload = {"merge_method": "squash",
+                   "commit_title": f"Merge PR #{number} (via Slack by {actor})"}
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.put(url, headers=headers, json=payload)
+            r.raise_for_status()
+
     async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
         verify_github_signature(
             raw_body=raw_body,
@@ -198,6 +260,8 @@ class GithubProvider:
         files = await self._pr_files(repo_full, number, installation_id)
         diff_blocks = build_diff_blocks(files, max_files=6)
 
+        action_payload = f"{repo_full}|{installation_id}|{number}"
+
         return {
             "channel": channel_id,
             "text": f"PR #{number}: {title}",
@@ -207,12 +271,15 @@ class GithubProvider:
                 {"type": "section",
                  "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
                 *diff_blocks,
+                {"type": "context", "block_id": "state", "elements": [
+                    {"type": "mrkdwn", "text": "*State:* Pending approval"}
+                ]},
                 {"type": "actions", "elements": [
                     {"type": "button",
                      "text": {"type": "plain_text", "text": "Approve ✅"},
                      "style": "primary",
                      "action_id": "pr_approve",
-                     "value": encode_ref(self.name, f"{repo_full}|{installation_id}|{number}")},
+                     "value": encode_ref(self.name, action_payload)},
                 ]},
             ],
         }
@@ -220,6 +287,10 @@ class GithubProvider:
     async def approve(self, payload: str, *, actor: str) -> None:
         repo_full, installation_id, num = payload.split("|", 2)
         await self._approve_pr(repo_full, int(num), actor=actor, installation_id=installation_id)
+
+    async def merge(self, payload: str, *, actor: str) -> None:
+        repo_full, installation_id, num = payload.split("|", 2)
+        await self._merge_pr(repo_full, int(num), actor=actor, installation_id=installation_id)
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -238,11 +309,45 @@ async def on_pr_approve(ack, body, client):
         raise web.HTTPBadRequest(text="Unknown provider")
 
     await provider.approve(payload, actor=actor)
+    channel = body["channel"]["id"]
+    ts = body["message"]["ts"]
+    blocks = body["message"].get("blocks", [])
+    blocks = set_state(blocks, f"*State:* Approved by {actor} — pending merge")
+    blocks = set_actions(blocks, approved=True,
+                         provider=provider_key, payload=payload)
+    await client.chat_update(channel=channel, ts=ts, blocks=blocks, text=body["message"].get("text", ""))
 
     await client.chat_postEphemeral(
-        channel=body["channel"]["id"],
+        channel=channel,
         user=body["user"]["id"],
         text="✅ Change approved",
+    )
+
+
+@bolt_app.action("pr_merge")
+async def on_pr_merge(ack, body, client):
+    await ack()
+    provider_key, payload = decode_ref(body["actions"][0]["value"])
+    actor = body["user"].get("name") or body["user"]["id"]
+
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        raise web.HTTPBadRequest(text="Unknown provider")
+
+    await provider.merge(payload, actor=actor)
+
+    channel = body["channel"]["id"]
+    ts = body["message"]["ts"]
+    blocks = body["message"].get("blocks", [])
+    blocks = set_state(blocks, f"*State:* Merged by {actor}")
+    blocks = set_actions(blocks, approved=True,
+                         provider=provider_key, payload=payload)
+    await client.chat_update(channel=channel, ts=ts, blocks=blocks, text=body["message"].get("text", ""))
+
+    await client.chat_postEphemeral(
+        channel=channel,
+        user=body["user"]["id"],
+        text="🚀 Change merged",
     )
 
 
