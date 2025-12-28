@@ -185,6 +185,43 @@ def set_actions(blocks: list[dict[str, Any]], *, state: str, provider: str, payl
     return blocks
 
 
+def is_pr_message(msg: Mapping[str, Any], *, number: int, repo_full: str) -> bool:
+    """Heuristic to identify a PR message we posted earlier."""
+    text = msg.get("text", "")
+    if f"PR #{number}" in text or repo_full in text:
+        return True
+
+    for b in msg.get("blocks", []) or []:
+        if b.get("type") == "header":
+            header_text = b.get("text", {}).get("text", "")
+            if header_text.startswith(f"PR #{number}"):
+                return True
+    return False
+
+
+async def find_existing_message_ts(*, channel_id: str, slack_client: Any | None, match: Any, pages: int = 3, page_size: int = 200) -> str | None:
+    """Search recent channel history for a message matching `match(msg)`.
+
+    Bounded scan (pages*page_size) to avoid heavy history reads.
+    """
+    if not slack_client:
+        return None
+
+    cursor = None
+    for _ in range(pages):
+        resp = await slack_client.conversations_history(
+            channel=channel_id, limit=page_size, cursor=cursor
+        )
+        for msg in resp.get("messages", []) or []:
+            if match(msg):
+                return msg.get("ts")
+
+        cursor = resp.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+    return None
+
+
 # -----------------------
 # Slack Bolt async app
 # -----------------------
@@ -281,38 +318,6 @@ class GithubProvider:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
 
-    def _is_same_pr_message(self, msg: dict[str, Any], number: int, repo_full: str) -> bool:
-        text = msg.get("text", "")
-        if f"PR #{number}" not in text and f"{repo_full}" not in text:
-            header_hit = False
-            for b in msg.get("blocks", []) or []:
-                if b.get("type") == "header":
-                    header_text = b.get("text", {}).get("text", "")
-                    if header_text.startswith(f"PR #{number}"):
-                        header_hit = True
-                        break
-            if not header_hit:
-                return False
-        return True
-
-    async def _find_existing_message_ts(self, channel_id: str, number: int, repo_full: str, slack_client: Any | None) -> str | None:
-        """Search recent channel history for the PR message to update instead of posting a new one."""
-        if not slack_client:
-            return None
-
-        cursor = None
-        for _ in range(3):  # up to ~600 messages scanned
-            resp = await slack_client.conversations_history(
-                channel=channel_id, limit=200, cursor=cursor
-            )
-            for msg in resp.get("messages", []) or []:
-                if self._is_same_pr_message(msg, number, repo_full):
-                    return msg.get("ts")
-            cursor = resp.get("response_metadata", {}).get("next_cursor") or None
-            if not cursor:
-                break
-        return None
-
     async def authorize(self, payload: str, *, actor: str, action: str) -> None:
         """Authorize based on GitHub repo permissions (write+)."""
         repo_full, installation_id, _ = self._decode_payload(payload)
@@ -349,6 +354,14 @@ class GithubProvider:
         url = pr.get("html_url")
         author = pr.get("user", {}).get("login", "unknown")
 
+        description = (pr.get("body") or "").strip()
+        if description:
+            max_desc = 2800  # stay under Slack block limits
+            if len(description) > max_desc:
+                description = description[:max_desc] + "…"
+        else:
+            description = "_No description provided._"
+
         channel_id = os.environ["SLACK_PR_CHANNEL_ID"]
         files = await self._pr_files(repo_full, number, installation_id)
         diff_blocks = build_diff_blocks(files, max_files=6)
@@ -360,6 +373,8 @@ class GithubProvider:
                                         "text": f"PR #{number}: {title}"}},
             {"type": "section",
              "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
+            {"type": "section",
+             "text": {"type": "mrkdwn", "text": f"*Description:*\n{description}"}},
             *diff_blocks,
             {"type": "context", "block_id": "state", "elements": [
                 {"type": "mrkdwn", "text": "*State:* Pending approval"}
@@ -375,7 +390,12 @@ class GithubProvider:
         }
 
         if action == "synchronize":
-            existing_ts = await self._find_existing_message_ts(channel_id, number, repo_full, slack_client)
+            existing_ts = await find_existing_message_ts(
+                channel_id=channel_id,
+                slack_client=slack_client,
+                match=lambda m: is_pr_message(
+                    m, number=number, repo_full=repo_full),
+            )
             if existing_ts:
                 message["ts"] = existing_ts
 
