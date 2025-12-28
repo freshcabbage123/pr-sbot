@@ -5,7 +5,7 @@ import time
 import json
 import hmac
 import hashlib
-from typing import Any
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 import httpx
 import jwt
@@ -57,38 +57,12 @@ async def github_installation_token(installation_id: str) -> str:
         return r.json()["token"]
 
 
-async def github_approve_pr(repo_full: str, number: int, *, actor: str, installation_id: str) -> None:
-    owner, name = repo_full.split("/", 1)
-    inst_token = await github_installation_token(installation_id)
-
-    url = f"https://api.github.com/repos/{owner}/{name}/pulls/{number}/reviews"
-    headers = {"Authorization": f"Bearer {inst_token}",
-               "Accept": "application/vnd.github+json"}
-    payload = {"event": "APPROVE", "body": f"Approved via Slack by {actor}"}
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-
-async def github_pr_files(repo_full: str, number: int, installation_id: str) -> list[dict[str, Any]]:
-    owner, repo = repo_full.split("/", 1)
-    inst_token = await github_installation_token(installation_id)
-
-    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
-    headers = {
-        "Authorization": f"Bearer {inst_token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        return r.json()
-    
+# -----------------------
+# Slack-friendly block helpers
+# -----------------------
 def build_diff_blocks(files: list[dict[str, Any]], max_files: int = 6) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
 
-    # small header line
     blocks.append({
         "type": "section",
         "text": {"type": "mrkdwn", "text": f"*Changed files:* {len(files)}"}
@@ -99,8 +73,6 @@ def build_diff_blocks(files: list[dict[str, Any]], max_files: int = 6) -> list[d
         status = f.get("status", "modified")
         patch = f.get("patch") or "(diff too large / not available)"
 
-        # keep the whole section under 3000 chars (Slack limit)
-        # leave room for filename/status + markdown overhead
         patch = patch[:2400]
 
         blocks.append({
@@ -114,10 +86,43 @@ def build_diff_blocks(files: list[dict[str, Any]], max_files: int = 6) -> list[d
     if len(files) > max_files:
         blocks.append({
             "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"_Showing first {max_files} files. View full diff on GitHub._"}]
+            "elements": [{"type": "mrkdwn", "text": f"_Showing first {max_files} files. View full diff on provider._"}]
         })
 
     return blocks
+
+
+def build_plain_block(title: str, body: str) -> list[dict[str, Any]]:
+    """Minimal block set for non-file change requests (e.g., DB/UI updates)."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+    ]
+
+# -----------------------
+# Provider protocol
+# -----------------------
+
+
+@runtime_checkable
+class Provider(Protocol):
+    name: str
+
+    async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
+        """Return Slack-ready payload or None if event not relevant."""
+
+    async def approve(self, payload: str, *, actor: str) -> None:
+        """Approve a change given the encoded payload from Slack action."""
+
+
+def encode_ref(provider: str, payload: str) -> str:
+    return f"{provider}:{payload}"
+
+
+def decode_ref(value: str) -> tuple[str, str]:
+    provider, payload = value.split(":", 1)
+    return provider, payload
+
 
 # -----------------------
 # Slack Bolt async app
@@ -128,39 +133,121 @@ bolt_app = AsyncApp(
 )
 
 
-def encode_ref(provider: str, repo_full: str, pr_number: int, extra: str | None = None) -> str:
-    # provider is "gh" or "gl"; extra can carry install/project ids
-    extra = extra or ""
-    return f"{provider}|{repo_full}|{extra}#{pr_number}"
+class GithubProvider:
+    name = "gh"
+
+    async def _pr_files(self, repo_full: str, number: int, installation_id: str) -> list[dict[str, Any]]:
+        owner, repo = repo_full.split("/", 1)
+        inst_token = await github_installation_token(installation_id)
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        headers = {
+            "Authorization": f"Bearer {inst_token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def _approve_pr(self, repo_full: str, number: int, *, actor: str, installation_id: str) -> None:
+        owner, name = repo_full.split("/", 1)
+        inst_token = await github_installation_token(installation_id)
+
+        url = f"https://api.github.com/repos/{owner}/{name}/pulls/{number}/reviews"
+        headers = {"Authorization": f"Bearer {inst_token}",
+                   "Accept": "application/vnd.github+json"}
+        payload = {"event": "APPROVE",
+                   "body": f"Approved via Slack by {actor}"}
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+
+    async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
+        verify_github_signature(
+            raw_body=raw_body,
+            signature_256=headers.get("X-Hub-Signature-256"),
+            secret=os.environ["GITHUB_WEBHOOK_SECRET"],
+        )
+
+        event = headers.get("X-GitHub-Event", "")
+        payload: dict[str, Any] = json.loads(raw_body.decode("utf-8"))
+
+        if event != "pull_request":
+            return None
+
+        action = payload.get("action")
+        if action not in {"opened", "reopened", "synchronize"}:
+            return None
+
+        pr = payload["pull_request"]
+        repo_full = payload["repository"]["full_name"]
+        installation_id = payload.get("installation", {}).get("id")
+        if not installation_id:
+            raise web.HTTPInternalServerError(
+                text="Missing GitHub installation id")
+        installation_id = str(installation_id)
+        number = pr["number"]
+        title = pr.get("title", "Pull request")
+        url = pr.get("html_url")
+        author = pr.get("user", {}).get("login", "unknown")
+
+        channel_id = os.environ["SLACK_PR_CHANNEL_ID"]
+        files = await self._pr_files(repo_full, number, installation_id)
+        diff_blocks = build_diff_blocks(files, max_files=6)
+
+        return {
+            "channel": channel_id,
+            "text": f"PR #{number}: {title}",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text",
+                                            "text": f"PR #{number}: {title}"}},
+                {"type": "section",
+                 "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
+                *diff_blocks,
+                {"type": "actions", "elements": [
+                    {"type": "button",
+                     "text": {"type": "plain_text", "text": "Approve ✅"},
+                     "style": "primary",
+                     "action_id": "pr_approve",
+                     "value": encode_ref(self.name, f"{repo_full}|{installation_id}|{number}")},
+                ]},
+            ],
+        }
+
+    async def approve(self, payload: str, *, actor: str) -> None:
+        repo_full, installation_id, num = payload.split("|", 2)
+        await self._approve_pr(repo_full, int(num), actor=actor, installation_id=installation_id)
 
 
-def decode_ref(value: str) -> tuple[str, str, str, int]:
-    provider_repo_extra, num = value.split("#", 1)
-    provider, repo, extra = provider_repo_extra.split("|", 2)
-    return provider, repo, extra, int(num)
+PROVIDERS: dict[str, Provider] = {
+    "gh": GithubProvider(),
+}
 
 
 @bolt_app.action("pr_approve")
 async def on_pr_approve(ack, body, client):
     await ack()
-    provider, repo_full, extra, pr_number = decode_ref(body["actions"][0]["value"])
+    provider_key, payload = decode_ref(body["actions"][0]["value"])
     actor = body["user"].get("name") or body["user"]["id"]
-    # Dispatch to the correct host
-    if provider == "gh":
-        installation_id = extra
-        if not installation_id:
-            raise web.HTTPInternalServerError(text="Missing GitHub installation id")
-        await github_approve_pr(repo_full, pr_number, actor=actor, installation_id=str(installation_id))
+
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        raise web.HTTPBadRequest(text="Unknown provider")
+
+    await provider.approve(payload, actor=actor)
 
     await client.chat_postEphemeral(
         channel=body["channel"]["id"],
         user=body["user"]["id"],
-        text=f"✅ Approved {repo_full}#{pr_number}",
+        text="✅ Change approved",
     )
 
 
 # -----------------------
-# aiohttp routes (Slack + GitHub on same server)
+# aiohttp routes (Slack + providers on same server)
 # -----------------------
 async def slack_events(request: web.Request) -> web.Response:
     bolt_req = await to_bolt_request(request)
@@ -170,50 +257,10 @@ async def slack_events(request: web.Request) -> web.Response:
 
 async def github_webhook(request: web.Request) -> web.Response:
     raw = await request.read()
+    message = await PROVIDERS["gh"].parse_event(raw, request.headers)
 
-    verify_github_signature(
-        raw_body=raw,
-        signature_256=request.headers.get("X-Hub-Signature-256"),
-        secret=os.environ["GITHUB_WEBHOOK_SECRET"],
-    )
-
-    event = request.headers.get("X-GitHub-Event", "")
-    payload: dict[str, Any] = json.loads(raw.decode("utf-8"))
-
-    if event == "pull_request":
-        action = payload.get("action")
-        if action in {"opened", "reopened", "synchronize"}:
-            pr = payload["pull_request"]
-            repo_full = payload["repository"]["full_name"]
-            installation_id = payload.get("installation", {}).get("id")
-            if not installation_id:
-                raise web.HTTPInternalServerError(text="Missing GitHub installation id")
-            installation_id = str(installation_id)
-            number = pr["number"]
-            title = pr["title"]
-            url = pr["html_url"]
-            author = pr["user"]["login"]
-
-            channel_id = os.environ["SLACK_PR_CHANNEL_ID"]
-            files = await github_pr_files(repo_full, number, installation_id)
-            diff_blocks = build_diff_blocks(files, max_files=6)
-            await bolt_app.client.chat_postMessage(
-                channel=channel_id,
-                text=f"PR #{number}: {title}",
-                blocks=[
-                    {"type": "header", "text": {"type": "plain_text", "text": f"PR #{number}: {title}"}},
-                    {"type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
-                    *diff_blocks,
-                    {"type": "actions", "elements": [
-                        {"type": "button",
-                        "text": {"type": "plain_text", "text": "Approve ✅"},
-                        "style": "primary",
-                        "action_id": "pr_approve",
-                        "value": encode_ref("gh", repo_full, number, installation_id)},
-                    ]},
-                ],
-            )
+    if message:
+        await bolt_app.client.chat_postMessage(**message)
 
     return web.json_response({"ok": True})
 
