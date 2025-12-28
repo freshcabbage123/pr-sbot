@@ -5,7 +5,7 @@ import time
 import json
 import hmac
 import hashlib
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol
 
 import httpx
 import jwt
@@ -92,19 +92,11 @@ def build_diff_blocks(files: list[dict[str, Any]], max_files: int = 6) -> list[d
     return blocks
 
 
-def build_plain_block(title: str, body: str) -> list[dict[str, Any]]:
-    """Minimal block set for non-file change requests (e.g., DB/UI updates)."""
-    return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body}},
-    ]
-
 # -----------------------
 # Provider protocol
 # -----------------------
 
 
-@runtime_checkable
 class Provider(Protocol):
     name: str
 
@@ -143,32 +135,38 @@ def set_state(blocks: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
     return blocks
 
 
-def set_actions(blocks: list[dict[str, Any]], *, approved: bool, provider: str, payload: str) -> list[dict[str, Any]]:
-    """Toggle action buttons: show approve OR merge depending on state."""
-    new_elements: list[dict[str, Any]]
-    if approved:
-        new_elements = [{
-            "type": "button",
-            "text": {"type": "plain_text", "text": "Merge 🚀"},
-            "style": "primary",
-            "action_id": "pr_merge",
-            "value": encode_ref(provider, payload),
-        }]
-    else:
+def set_actions(blocks: list[dict[str, Any]], *, state: str, provider: str, payload: str | None = None) -> list[dict[str, Any]]:
+    """Toggle action buttons based on state: pending -> approve, approved -> merge, merged -> none."""
+    if state == "pending":
         new_elements = [{
             "type": "button",
             "text": {"type": "plain_text", "text": "Approve ✅"},
             "style": "primary",
             "action_id": "pr_approve",
-            "value": encode_ref(provider, payload),
+            "value": encode_ref(provider, payload or ""),
         }]
+    elif state == "approved":
+        new_elements = [{
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Merge 🚀"},
+            "style": "primary",
+            "action_id": "pr_merge",
+            "value": encode_ref(provider, payload or ""),
+        }]
+    else:  # merged or closed
+        new_elements = []
 
-    for b in blocks:
+    for idx, b in enumerate(blocks):
         if b.get("type") == "actions":
-            b["elements"] = new_elements
+            if new_elements:
+                b["elements"] = new_elements
+                return blocks
+            # remove actions block when no buttons are needed
+            del blocks[idx]
             return blocks
 
-    blocks.append({"type": "actions", "elements": new_elements})
+    if new_elements:
+        blocks.append({"type": "actions", "elements": new_elements})
     return blocks
 
 
@@ -262,26 +260,23 @@ class GithubProvider:
 
         action_payload = f"{repo_full}|{installation_id}|{number}"
 
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text",
+                                        "text": f"PR #{number}: {title}"}},
+            {"type": "section",
+             "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
+            *diff_blocks,
+            {"type": "context", "block_id": "state", "elements": [
+                {"type": "mrkdwn", "text": "*State:* Pending approval"}
+            ]},
+        ]
+        blocks = set_actions(blocks, state="pending",
+                             provider=self.name, payload=action_payload)
+
         return {
             "channel": channel_id,
             "text": f"PR #{number}: {title}",
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text",
-                                            "text": f"PR #{number}: {title}"}},
-                {"type": "section",
-                 "text": {"type": "mrkdwn", "text": f"*Repo:* `{repo_full}`\n*Author:* `{author}`\n<{url}|View on GitHub>"}},
-                *diff_blocks,
-                {"type": "context", "block_id": "state", "elements": [
-                    {"type": "mrkdwn", "text": "*State:* Pending approval"}
-                ]},
-                {"type": "actions", "elements": [
-                    {"type": "button",
-                     "text": {"type": "plain_text", "text": "Approve ✅"},
-                     "style": "primary",
-                     "action_id": "pr_approve",
-                     "value": encode_ref(self.name, action_payload)},
-                ]},
-            ],
+            "blocks": blocks,
         }
 
     async def approve(self, payload: str, *, actor: str) -> None:
@@ -313,7 +308,7 @@ async def on_pr_approve(ack, body, client):
     ts = body["message"]["ts"]
     blocks = body["message"].get("blocks", [])
     blocks = set_state(blocks, f"*State:* Approved by {actor} — pending merge")
-    blocks = set_actions(blocks, approved=True,
+    blocks = set_actions(blocks, state="approved",
                          provider=provider_key, payload=payload)
     await client.chat_update(channel=channel, ts=ts, blocks=blocks, text=body["message"].get("text", ""))
 
@@ -340,7 +335,7 @@ async def on_pr_merge(ack, body, client):
     ts = body["message"]["ts"]
     blocks = body["message"].get("blocks", [])
     blocks = set_state(blocks, f"*State:* Merged by {actor}")
-    blocks = set_actions(blocks, approved=True,
+    blocks = set_actions(blocks, state="merged",
                          provider=provider_key, payload=payload)
     await client.chat_update(channel=channel, ts=ts, blocks=blocks, text=body["message"].get("text", ""))
 
