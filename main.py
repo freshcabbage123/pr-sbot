@@ -103,6 +103,9 @@ class Provider(Protocol):
     async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
         """Return Slack-ready payload or None if event not relevant."""
 
+    async def authorize(self, payload: str, *, actor: str, action: str) -> None:
+        """Validate that the actor can perform the action. Raise HTTPForbidden on denial."""
+
     async def approve(self, payload: str, *, actor: str) -> None:
         """Approve a change given the encoded payload from Slack action."""
 
@@ -142,7 +145,7 @@ def set_actions(blocks: list[dict[str, Any]], *, state: str, provider: str, payl
             "type": "button",
             "text": {"type": "plain_text", "text": "Approve ✅"},
             "style": "primary",
-            "action_id": "pr_approve",
+            "action_id": "change_request_approve",
             "value": encode_ref(provider, payload or ""),
         }]
     elif state == "approved":
@@ -180,7 +183,34 @@ bolt_app = AsyncApp(
 
 
 class GithubProvider:
-    name = "gh"
+    name = "github"
+
+    def _decode_payload(self, payload: str) -> tuple[str, str, int]:
+        repo_full, installation_id, num = payload.split("|", 2)
+        return repo_full, installation_id, int(num)
+
+    async def _has_write_access(self, repo_full: str, username: str, installation_id: str) -> bool:
+        """Check if the GitHub user has write/maintain/admin on the repo."""
+        if not username:
+            return False
+
+        owner, repo = repo_full.split("/", 1)
+        inst_token = await github_installation_token(installation_id)
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/collaborators/{username}/permission"
+        headers = {
+            "Authorization": f"Bearer {inst_token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 404:
+                return False
+            r.raise_for_status()
+
+        perm = r.json().get("permission")
+        return perm in {"admin", "maintain", "write"}
 
     async def _pr_files(self, repo_full: str, number: int, installation_id: str) -> list[dict[str, Any]]:
         owner, repo = repo_full.split("/", 1)
@@ -224,6 +254,13 @@ class GithubProvider:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.put(url, headers=headers, json=payload)
             r.raise_for_status()
+
+    async def authorize(self, payload: str, *, actor: str, action: str) -> None:
+        """Authorize based on GitHub repo permissions (write+)."""
+        repo_full, installation_id, _ = self._decode_payload(payload)
+        has_access = await self._has_write_access(repo_full, actor, installation_id)
+        if not has_access:
+            raise web.HTTPForbidden(text="Insufficient permissions")
 
     async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
         verify_github_signature(
@@ -280,21 +317,21 @@ class GithubProvider:
         }
 
     async def approve(self, payload: str, *, actor: str) -> None:
-        repo_full, installation_id, num = payload.split("|", 2)
-        await self._approve_pr(repo_full, int(num), actor=actor, installation_id=installation_id)
+        repo_full, installation_id, num = self._decode_payload(payload)
+        await self._approve_pr(repo_full, num, actor=actor, installation_id=installation_id)
 
     async def merge(self, payload: str, *, actor: str) -> None:
-        repo_full, installation_id, num = payload.split("|", 2)
-        await self._merge_pr(repo_full, int(num), actor=actor, installation_id=installation_id)
+        repo_full, installation_id, num = self._decode_payload(payload)
+        await self._merge_pr(repo_full, num, actor=actor, installation_id=installation_id)
 
 
 PROVIDERS: dict[str, Provider] = {
-    "gh": GithubProvider(),
+    "github": GithubProvider(),
 }
 
 
-@bolt_app.action("pr_approve")
-async def on_pr_approve(ack, body, client):
+@bolt_app.action("change_request_approve")
+async def on_change_request_approve(ack, body, client):
     await ack()
     provider_key, payload = decode_ref(body["actions"][0]["value"])
     actor = body["user"].get("name") or body["user"]["id"]
@@ -302,6 +339,16 @@ async def on_pr_approve(ack, body, client):
     provider = PROVIDERS.get(provider_key)
     if not provider:
         raise web.HTTPBadRequest(text="Unknown provider")
+
+    try:
+        await provider.authorize(payload, actor=actor, action="approve")
+    except web.HTTPForbidden:
+        await client.chat_postEphemeral(
+            channel=body["channel"]["id"],
+            user=body["user"]["id"],
+            text="You don't have permission to approve this change.",
+        )
+        return
 
     await provider.approve(payload, actor=actor)
     channel = body["channel"]["id"]
@@ -328,6 +375,16 @@ async def on_pr_merge(ack, body, client):
     provider = PROVIDERS.get(provider_key)
     if not provider:
         raise web.HTTPBadRequest(text="Unknown provider")
+
+    try:
+        await provider.authorize(payload, actor=actor, action="merge")
+    except web.HTTPForbidden:
+        await client.chat_postEphemeral(
+            channel=body["channel"]["id"],
+            user=body["user"]["id"],
+            text="You don't have permission to merge this change.",
+        )
+        return
 
     await provider.merge(payload, actor=actor)
 
@@ -357,7 +414,7 @@ async def slack_events(request: web.Request) -> web.Response:
 
 async def github_webhook(request: web.Request) -> web.Response:
     raw = await request.read()
-    message = await PROVIDERS["gh"].parse_event(raw, request.headers)
+    message = await PROVIDERS["github"].parse_event(raw, request.headers)
 
     if message:
         await bolt_app.client.chat_postMessage(**message)
