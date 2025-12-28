@@ -100,7 +100,7 @@ def build_diff_blocks(files: list[dict[str, Any]], max_files: int = 6) -> list[d
 class Provider(Protocol):
     name: str
 
-    async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
+    async def parse_event(self, raw_body: bytes, headers: Mapping[str, str], slack_client: Any | None = None) -> dict[str, Any] | None:
         """Return Slack-ready payload or None if event not relevant."""
 
     async def authorize(self, payload: str, *, actor: str, action: str) -> None:
@@ -108,6 +108,9 @@ class Provider(Protocol):
 
     async def approve(self, payload: str, *, actor: str) -> None:
         """Approve a change given the encoded payload from Slack action."""
+
+    async def request_changes(self, payload: str, *, actor: str, comment: str) -> None:
+        """Request changes with a required comment."""
 
     async def merge(self, payload: str, *, actor: str) -> None:
         """Merge a change given the encoded payload from Slack action."""
@@ -141,13 +144,22 @@ def set_state(blocks: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
 def set_actions(blocks: list[dict[str, Any]], *, state: str, provider: str, payload: str | None = None) -> list[dict[str, Any]]:
     """Toggle action buttons based on state: pending -> approve, approved -> merge, merged -> none."""
     if state == "pending":
-        new_elements = [{
-            "type": "button",
-            "text": {"type": "plain_text", "text": "Approve ✅"},
-            "style": "primary",
-            "action_id": "change_request_approve",
-            "value": encode_ref(provider, payload or ""),
-        }]
+        new_elements = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve ✅"},
+                "style": "primary",
+                "action_id": "change_request_approve",
+                "value": encode_ref(provider, payload or ""),
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Request changes"},
+                "style": "danger",
+                "action_id": "request_changes",
+                "value": encode_ref(provider, payload or ""),
+            },
+        ]
     elif state == "approved":
         new_elements = [{
             "type": "button",
@@ -255,6 +267,52 @@ class GithubProvider:
             r = await client.put(url, headers=headers, json=payload)
             r.raise_for_status()
 
+    async def _request_changes(self, repo_full: str, number: int, *, actor: str, installation_id: str, comment: str) -> None:
+        owner, name = repo_full.split("/", 1)
+        inst_token = await github_installation_token(installation_id)
+
+        url = f"https://api.github.com/repos/{owner}/{name}/pulls/{number}/reviews"
+        headers = {"Authorization": f"Bearer {inst_token}",
+                   "Accept": "application/vnd.github+json"}
+        payload = {"event": "REQUEST_CHANGES",
+                   "body": f"Changes requested via Slack by {actor}: {comment}"}
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+
+    def _is_same_pr_message(self, msg: dict[str, Any], number: int, repo_full: str) -> bool:
+        text = msg.get("text", "")
+        if f"PR #{number}" not in text and f"{repo_full}" not in text:
+            header_hit = False
+            for b in msg.get("blocks", []) or []:
+                if b.get("type") == "header":
+                    header_text = b.get("text", {}).get("text", "")
+                    if header_text.startswith(f"PR #{number}"):
+                        header_hit = True
+                        break
+            if not header_hit:
+                return False
+        return True
+
+    async def _find_existing_message_ts(self, channel_id: str, number: int, repo_full: str, slack_client: Any | None) -> str | None:
+        """Search recent channel history for the PR message to update instead of posting a new one."""
+        if not slack_client:
+            return None
+
+        cursor = None
+        for _ in range(3):  # up to ~600 messages scanned
+            resp = await slack_client.conversations_history(
+                channel=channel_id, limit=200, cursor=cursor
+            )
+            for msg in resp.get("messages", []) or []:
+                if self._is_same_pr_message(msg, number, repo_full):
+                    return msg.get("ts")
+            cursor = resp.get("response_metadata", {}).get("next_cursor") or None
+            if not cursor:
+                break
+        return None
+
     async def authorize(self, payload: str, *, actor: str, action: str) -> None:
         """Authorize based on GitHub repo permissions (write+)."""
         repo_full, installation_id, _ = self._decode_payload(payload)
@@ -262,7 +320,7 @@ class GithubProvider:
         if not has_access:
             raise web.HTTPForbidden(text="Insufficient permissions")
 
-    async def parse_event(self, raw_body: bytes, headers: Mapping[str, str]) -> dict[str, Any] | None:
+    async def parse_event(self, raw_body: bytes, headers: Mapping[str, str], slack_client: Any | None = None) -> dict[str, Any] | None:
         verify_github_signature(
             raw_body=raw_body,
             signature_256=headers.get("X-Hub-Signature-256"),
@@ -310,15 +368,26 @@ class GithubProvider:
         blocks = set_actions(blocks, state="pending",
                              provider=self.name, payload=action_payload)
 
-        return {
+        message: dict[str, Any] = {
             "channel": channel_id,
             "text": f"PR #{number}: {title}",
             "blocks": blocks,
         }
 
+        if action == "synchronize":
+            existing_ts = await self._find_existing_message_ts(channel_id, number, repo_full, slack_client)
+            if existing_ts:
+                message["ts"] = existing_ts
+
+        return message
+
     async def approve(self, payload: str, *, actor: str) -> None:
         repo_full, installation_id, num = self._decode_payload(payload)
         await self._approve_pr(repo_full, num, actor=actor, installation_id=installation_id)
+
+    async def request_changes(self, payload: str, *, actor: str, comment: str) -> None:
+        repo_full, installation_id, num = self._decode_payload(payload)
+        await self._request_changes(repo_full, num, actor=actor, installation_id=installation_id, comment=comment)
 
     async def merge(self, payload: str, *, actor: str) -> None:
         repo_full, installation_id, num = self._decode_payload(payload)
@@ -363,6 +432,110 @@ async def on_change_request_approve(ack, body, client):
         channel=channel,
         user=body["user"]["id"],
         text="✅ Change approved",
+    )
+
+
+@bolt_app.action("request_changes")
+async def on_request_changes(ack, body, client):
+    await ack()
+    provider_key, payload = decode_ref(body["actions"][0]["value"])
+    actor = body["user"].get("name") or body["user"]["id"]
+
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        raise web.HTTPBadRequest(text="Unknown provider")
+
+    try:
+        await provider.authorize(payload, actor=actor, action="request_changes")
+    except web.HTTPForbidden:
+        await client.chat_postEphemeral(
+            channel=body["channel"]["id"],
+            user=body["user"]["id"],
+            text="You don't have permission to request changes on this.",
+        )
+        return
+
+    await client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "request_changes_submit",
+            "title": {"type": "plain_text", "text": "Request changes"},
+            "submit": {"type": "plain_text", "text": "Send"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "private_metadata": json.dumps({
+                "provider_key": provider_key,
+                "payload": payload,
+                "channel": body["channel"]["id"],
+                "ts": body["message"]["ts"],
+                "text": body["message"].get("text", ""),
+                "blocks": body["message"].get("blocks", []),
+            }),
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "comment",
+                    "element": {
+                        "type": "plain_text_input",
+                        "multiline": True,
+                        "action_id": "value",
+                        "placeholder": {"type": "plain_text", "text": "Describe what needs to change"},
+                    },
+                    "label": {"type": "plain_text", "text": "Comment"},
+                }
+            ],
+        },
+    )
+
+
+@bolt_app.view("request_changes_submit")
+async def handle_request_changes_submit(ack, body, client, view):
+    await ack()
+    meta = json.loads(view.get("private_metadata", "{}"))
+    provider_key = meta.get("provider_key")
+    payload = meta.get("payload")
+    channel = meta.get("channel")
+    ts = meta.get("ts")
+    original_text = meta.get("text", "")
+    blocks = meta.get("blocks") or []
+
+    if not (provider_key and payload and channel and ts):
+        return
+
+    provider = PROVIDERS.get(provider_key)
+    if not provider:
+        return
+
+    actor = body["user"].get("name") or body["user"]["id"]
+    comment = view["state"]["values"]["comment"]["value"].get(
+        "value", "").strip()
+    if not comment:
+        comment = "(no comment provided)"
+
+    try:
+        await provider.authorize(payload, actor=actor, action="request_changes")
+    except web.HTTPForbidden:
+        await client.chat_postEphemeral(
+            channel=channel,
+            user=body["user"]["id"],
+            text="You don't have permission to request changes on this.",
+        )
+        return
+
+    await provider.request_changes(payload, actor=actor, comment=comment)
+
+    blocks = set_state(
+        blocks, f"*State:* Changes requested by {actor}\n>{comment}")
+    blocks = set_actions(blocks, state="changes_requested",
+                         provider=provider_key, payload=payload)
+
+    await client.chat_update(channel=channel, ts=ts,
+                             blocks=blocks, text=original_text)
+
+    await client.chat_postEphemeral(
+        channel=channel,
+        user=body["user"]["id"],
+        text="Changes requested and comment posted.",
     )
 
 
@@ -414,10 +587,15 @@ async def slack_events(request: web.Request) -> web.Response:
 
 async def github_webhook(request: web.Request) -> web.Response:
     raw = await request.read()
-    message = await PROVIDERS["github"].parse_event(raw, request.headers)
+    message = await PROVIDERS["github"].parse_event(raw, request.headers, slack_client=bolt_app.client)
 
     if message:
-        await bolt_app.client.chat_postMessage(**message)
+        if "ts" in message:
+            ts = message["ts"]
+            payload = {k: v for k, v in message.items() if k != "ts"}
+            await bolt_app.client.chat_update(ts=ts, **payload)
+        else:
+            await bolt_app.client.chat_postMessage(**message)
 
     return web.json_response({"ok": True})
 
