@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import json
@@ -11,7 +12,7 @@ import httpx
 import jwt
 from aiohttp import web
 from slack_bolt.async_app import AsyncApp
-from slack_bolt.adapter.aiohttp import to_bolt_request, to_aiohttp_response
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -95,8 +96,6 @@ def build_diff_blocks(files: list[dict[str, Any]], max_files: int = 6) -> list[d
 # -----------------------
 # Provider protocol
 # -----------------------
-
-
 class Provider(Protocol):
     name: str
 
@@ -590,14 +589,8 @@ async def on_pr_merge(ack, body, client):
 
 
 # -----------------------
-# aiohttp routes (Slack + providers on same server)
+# aiohttp routes (GitHub webhook; Slack handled via Socket Mode)
 # -----------------------
-async def slack_events(request: web.Request) -> web.Response:
-    bolt_req = await to_bolt_request(request)
-    bolt_resp = await bolt_app.async_dispatch(bolt_req)
-    return await to_aiohttp_response(bolt_resp)
-
-
 async def github_webhook(request: web.Request) -> web.Response:
     raw = await request.read()
     message = await PROVIDERS["github"].parse_event(raw, request.headers, slack_client=bolt_app.client)
@@ -615,11 +608,30 @@ async def github_webhook(request: web.Request) -> web.Response:
 
 def build_aiohttp_app() -> web.Application:
     app = web.Application()
-    app.router.add_post("/slack/events", slack_events)
     app.router.add_post("/webhook/github", github_webhook)
     return app
 
 
-if __name__ == "__main__":
+async def start_http_server(port: int) -> None:
+    app = build_aiohttp_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    await asyncio.Event().wait()  # keep server alive
+
+
+async def main() -> None:
     port = int(os.environ.get("PORT", "3000"))
-    web.run_app(build_aiohttp_app(), port=port)
+    handler = AsyncSocketModeHandler(
+        bolt_app, os.environ["SLACK_APP_TOKEN"]
+    )
+
+    await asyncio.gather(
+        handler.start_async(),
+        start_http_server(port),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
